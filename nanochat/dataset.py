@@ -4,25 +4,28 @@ This file contains utilities for:
 - iterating over the parquet files and yielding documents from it
 - download the files on demand if they are not on disk
 
-For details of how the dataset was prepared, see `repackage_data_reference.py`.
+Shakespeare dataset: Downloads and preprocesses Shakespeare's works into parquet format.
 """
 
 import os
 import argparse
-import time
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
-from multiprocessing import Pool
 
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
-# The specifics of the current pretraining dataset
+# Shakespeare dataset configuration
 
-# The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
-MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+# URL for the complete works of Shakespeare (from Karpathy's char-rnn repo)
+SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+# Configuration for how to split Shakespeare into documents
+CHUNK_SIZE = 2000  # characters per document chunk
+OVERLAP = 200  # overlap between chunks to preserve context
+VAL_RATIO = 0.1  # 10% for validation
+
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -57,72 +60,146 @@ def parquets_iter_batched(split, start=0, step=1):
             yield texts
 
 # -----------------------------------------------------------------------------
-def download_single_file(index):
-    """ Downloads a single file index, with some backoff """
+# Shakespeare-specific functions
 
-    # Construct the local filepath for this file and skip if it already exists
-    filename = index_to_filename(index)
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        print(f"Skipping {filepath} (already exists)")
-        return True
+def download_shakespeare():
+    """Download the Shakespeare text file."""
+    raw_path = os.path.join(DATA_DIR, "shakespeare_raw.txt")
 
-    # Construct the remote URL for this file
-    url = f"{BASE_URL}/{filename}"
-    print(f"Downloading {filename}...")
+    if os.path.exists(raw_path):
+        print(f"Shakespeare text already exists at {raw_path}")
+        with open(raw_path, 'r', encoding='utf-8') as f:
+            return f.read()
 
-    # Download with retries
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            # Write to temporary file first
-            temp_path = filepath + f".tmp"
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                    if chunk:
-                        f.write(chunk)
-            # Move temp file to final location
-            os.rename(temp_path, filepath)
-            print(f"Successfully downloaded {filename}")
-            return True
+    print(f"Downloading Shakespeare from {SHAKESPEARE_URL}...")
+    response = requests.get(SHAKESPEARE_URL, timeout=30)
+    response.raise_for_status()
+    text = response.text
 
-        except (requests.RequestException, IOError) as e:
-            print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            # Clean up any partial files
-            for path in [filepath + f".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except:
-                        pass
-            # Try a few times with exponential backoff: 2^attempt seconds
-            if attempt < max_attempts:
-                wait_time = 2 ** attempt
-                print(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                print(f"Failed to download {filename} after {max_attempts} attempts")
-                return False
+    with open(raw_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    print(f"Downloaded {len(text):,} characters to {raw_path}")
 
-    return False
+    return text
+
+def split_into_chunks(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
+    """Split text into overlapping chunks, trying to break at paragraph boundaries."""
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+
+        if end >= len(text):
+            # Last chunk - take everything remaining
+            chunks.append(text[start:])
+            break
+
+        # Try to find a good breaking point (paragraph or sentence)
+        # Look for double newline (paragraph break) first
+        search_start = max(start + chunk_size - 200, start)
+        search_end = min(start + chunk_size + 200, len(text))
+        search_region = text[search_start:search_end]
+
+        # Prefer paragraph breaks
+        para_break = search_region.rfind('\n\n')
+        if para_break != -1:
+            end = search_start + para_break + 2
+        else:
+            # Fall back to sentence break
+            for punct in ['. ', '! ', '? ', '.\n', '!\n', '?\n']:
+                sent_break = search_region.rfind(punct)
+                if sent_break != -1:
+                    end = search_start + sent_break + len(punct)
+                    break
+
+        chunks.append(text[start:end])
+        start = end - overlap  # overlap for context continuity
+
+    return chunks
+
+def create_parquet_shards(chunks, val_ratio=VAL_RATIO):
+    """Create train and val parquet files from text chunks."""
+    # Shuffle chunks for better distribution
+    import random
+    random.seed(42)
+    shuffled = chunks.copy()
+    random.shuffle(shuffled)
+
+    # Split into train/val
+    val_size = max(1, int(len(shuffled) * val_ratio))
+    val_chunks = shuffled[:val_size]
+    train_chunks = shuffled[val_size:]
+
+    print(f"Train chunks: {len(train_chunks)}, Val chunks: {val_size}")
+
+    # Create train parquet (shard_00000.parquet)
+    train_path = os.path.join(DATA_DIR, "shard_00000.parquet")
+    train_table = pa.table({'text': train_chunks})
+    pq.write_table(train_table, train_path, row_group_size=64)
+    print(f"Wrote train shard to {train_path}")
+
+    # Create val parquet (shard_00001.parquet) - last shard is always val
+    val_path = os.path.join(DATA_DIR, "shard_00001.parquet")
+    val_table = pa.table({'text': val_chunks})
+    pq.write_table(val_table, val_path, row_group_size=64)
+    print(f"Wrote val shard to {val_path}")
+
+    return train_path, val_path
+
+def prepare_shakespeare_dataset(num_epochs=1):
+    """
+    Main function to download and prepare the Shakespeare dataset.
+    num_epochs: repeat the data this many times to create more training data.
+    """
+    # Check if already prepared
+    parquet_files = list_parquet_files()
+    if len(parquet_files) >= 2:
+        print(f"Dataset already prepared with {len(parquet_files)} shards")
+        return parquet_files
+
+    # Download Shakespeare
+    text = download_shakespeare()
+    print(f"Total characters: {len(text):,}")
+
+    # Split into chunks
+    chunks = split_into_chunks(text)
+    print(f"Split into {len(chunks)} chunks")
+
+    # Repeat for more epochs if requested
+    if num_epochs > 1:
+        chunks = chunks * num_epochs
+        print(f"After {num_epochs}x epochs: {len(chunks)} total chunks")
+
+    # Create parquet files
+    train_path, val_path = create_parquet_shards(chunks)
+
+    print(f"\nShakespeare dataset ready!")
+    print(f"  Train: {train_path}")
+    print(f"  Val: {val_path}")
+
+    return [train_path, val_path]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download FineWeb-Edu 100BT dataset shards")
-    parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of shards to download (default: -1), -1 = disable")
-    parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
+    parser = argparse.ArgumentParser(description="Download and prepare Shakespeare dataset")
+    parser.add_argument("-n", "--num-epochs", type=int, default=1,
+                        help="Number of times to repeat the data (default: 1)")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
+                        help=f"Characters per chunk (default: {CHUNK_SIZE})")
+    parser.add_argument("--overlap", type=int, default=OVERLAP,
+                        help=f"Overlap between chunks (default: {OVERLAP})")
     args = parser.parse_args()
 
-    num = MAX_SHARD + 1 if args.num_files == -1 else min(args.num_files, MAX_SHARD + 1)
-    ids_to_download = list(range(num))
-    print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
-    print(f"Target directory: {DATA_DIR}")
-    print()
-    with Pool(processes=args.num_workers) as pool:
-        results = pool.map(download_single_file, ids_to_download)
+    # Update globals if overridden
+    CHUNK_SIZE = args.chunk_size
+    OVERLAP = args.overlap
 
-    # Report results
-    successful = sum(1 for success in results if success)
-    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+    print(f"Preparing Shakespeare dataset...")
+    print(f"  Chunk size: {CHUNK_SIZE}")
+    print(f"  Overlap: {OVERLAP}")
+    print(f"  Epochs: {args.num_epochs}")
+    print(f"  Target directory: {DATA_DIR}")
+    print()
+
+    prepare_shakespeare_dataset(num_epochs=args.num_epochs)
