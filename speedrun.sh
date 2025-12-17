@@ -71,7 +71,7 @@ python -m scripts.tok_eval
 # Using depth=12 for a smaller model that can learn from limited data
 
 # Number of processes/GPUs to use
-NPROC_PER_NODE=8
+NPROC_PER_NODE=1
 
 # pretrain a smaller model on Shakespeare (depth=12, fewer iterations)
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --num_iterations=1000 --run=$WANDB_RUN
