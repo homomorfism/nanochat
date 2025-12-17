@@ -11,7 +11,7 @@ nanochat is a full-stack LLM implementation (like ChatGPT) in a minimal, hackabl
 ### Environment Setup
 ```bash
 # Create venv and install dependencies (uses uv)
-uv venv && uv sync --extra gpu
+uv venv && uv sync
 source .venv/bin/activate
 
 # Build the Rust BPE tokenizer
